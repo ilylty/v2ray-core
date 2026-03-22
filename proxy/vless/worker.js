@@ -21,6 +21,18 @@ const proxyIPs = [
     { region: 'Multacom', domain: 'ProxyIP.Multacom.CMLiussss.net', port: 443 }
 ];
 
+const VLESS_CMD_TCP = 1;
+const VLESS_CMD_UDP = 2;
+const VLESS_CMD_MUX = 3;
+
+const MUX_STATUS_NEW = 1;
+const MUX_STATUS_KEEP = 2;
+const MUX_STATUS_END = 3;
+const MUX_OPTION_DATA = 1;
+const MUX_OPTION_ERROR = 2;
+const MUX_NETWORK_TCP = 1;
+const MUX_NETWORK_UDP = 2;
+
 export default {
     async fetch(request, env, ctx) {
         try {
@@ -65,6 +77,7 @@ async function handleWsRequest(request, targetRegion) {
     let remoteConnWrapper = { socket: null };
     let isDnsQuery = false;
     let protocolType = null;
+    let muxWorker = null;
 
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStream(serverSock, earlyData);
@@ -72,6 +85,10 @@ async function handleWsRequest(request, targetRegion) {
     readable.pipeTo(new WritableStream({
         async write(chunk) {
             if (isDnsQuery) return await forwardUDP(chunk, serverSock, null);
+
+            if (protocolType === 'vless-mux') {
+                return await muxWorker.handleChunk(chunk);
+            }
             
             if (remoteConnWrapper.socket) {
                 const writer = remoteConnWrapper.socket.writable.getWriter();
@@ -86,7 +103,17 @@ async function handleWsRequest(request, targetRegion) {
                     const vlessResult = parseWsPacketHeader(chunk, USER_ID);
                     if (!vlessResult.hasError) {
                         protocolType = 'vless';
-                        const { addressType, port, hostname, rawIndex, version, isUDP } = vlessResult;
+                        const { addressType, port, hostname, rawIndex, version, isUDP, command } = vlessResult;
+
+                        if (command === VLESS_CMD_MUX) {
+                            protocolType = 'vless-mux';
+                            muxWorker = new VlessMuxWorker(serverSock, version[0]);
+                            const rawData = chunk.slice(rawIndex);
+                            if (rawData.byteLength > 0) {
+                                await muxWorker.handleChunk(rawData);
+                            }
+                            return;
+                        }
                         
                         
                         if (isUDP) {
@@ -205,9 +232,22 @@ function parseWsPacketHeader(chunk, targetID) {
     const optLen = new Uint8Array(chunk.slice(17, 18))[0];
     const cmd = new Uint8Array(chunk.slice(18 + optLen, 19 + optLen))[0];
     
-    let isUDP = cmd === 2;
+    let isUDP = cmd === VLESS_CMD_UDP;
     
-    if (cmd !== 1 && cmd !== 2) return { hasError: true };
+    if (cmd === VLESS_CMD_MUX) {
+        return {
+            hasError: false,
+            addressType: 0,
+            port: 0,
+            hostname: '',
+            isUDP: false,
+            rawIndex: 19 + optLen,
+            version,
+            command: cmd
+        };
+    }
+
+    if (cmd !== VLESS_CMD_TCP && cmd !== VLESS_CMD_UDP) return { hasError: true };
 
     const portIdx = 19 + optLen;
     const port = new DataView(chunk.slice(portIdx, portIdx + 2)).getUint16(0);
@@ -249,8 +289,216 @@ function parseWsPacketHeader(chunk, targetID) {
         hostname, 
         isUDP, 
         rawIndex: addrValIdx + addrLen, 
-        version 
+        version,
+        command: cmd
     };
+}
+
+class VlessMuxWorker {
+    constructor(webSocket, versionByte) {
+        this.webSocket = webSocket;
+        this.versionByte = versionByte;
+        this.pending = new Uint8Array(0);
+        this.sentRespHeader = false;
+        this.sessions = new Map();
+    }
+
+    async handleChunk(chunk) {
+        const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        this.pending = concatUint8Arrays(this.pending, data);
+        while (true) {
+            const frame = tryParseMuxFrame(this.pending);
+            if (!frame) break;
+            this.pending = this.pending.slice(frame.totalSize);
+            await this.handleFrame(frame);
+        }
+    }
+
+    async handleFrame(frame) {
+        if (frame.status === MUX_STATUS_NEW) {
+            return await this.handleNew(frame);
+        }
+
+        const session = this.sessions.get(frame.sessionId);
+        if (!session) return;
+
+        if ((frame.option & MUX_OPTION_DATA) !== 0 && frame.data && frame.data.byteLength > 0) {
+            try {
+                const writer = session.socket.writable.getWriter();
+                await writer.write(frame.data);
+                writer.releaseLock();
+            } catch (error) {
+                this.closeSession(frame.sessionId, true);
+            }
+        }
+
+        if (frame.status === MUX_STATUS_END) {
+            this.closeSession(frame.sessionId, false);
+        }
+    }
+
+    async handleNew(frame) {
+        if (!frame.target || frame.target.network !== MUX_NETWORK_TCP) {
+            this.sendMuxFrame(frame.sessionId, MUX_STATUS_END, MUX_OPTION_ERROR, null);
+            return;
+        }
+
+        try {
+            const socket = connect({ hostname: frame.target.hostname, port: frame.target.port });
+            this.sessions.set(frame.sessionId, { socket });
+            socket.closed.catch(() => {}).finally(() => {
+                this.closeSession(frame.sessionId, false);
+            });
+
+            this.pipeRemoteToClient(frame.sessionId, socket);
+
+            if ((frame.option & MUX_OPTION_DATA) !== 0 && frame.data && frame.data.byteLength > 0) {
+                const writer = socket.writable.getWriter();
+                await writer.write(frame.data);
+                writer.releaseLock();
+            }
+        } catch (error) {
+            this.sendMuxFrame(frame.sessionId, MUX_STATUS_END, MUX_OPTION_ERROR, null);
+        }
+    }
+
+    async pipeRemoteToClient(sessionId, socket) {
+        await socket.readable.pipeTo(new WritableStream({
+            write: (chunk) => {
+                this.sendMuxFrame(sessionId, MUX_STATUS_KEEP, MUX_OPTION_DATA, chunk);
+            },
+        })).catch(() => {});
+
+        this.sendMuxFrame(sessionId, MUX_STATUS_END, 0, null);
+        this.closeSession(sessionId, false);
+    }
+
+    sendMuxFrame(sessionId, status, option, payload) {
+        if (this.webSocket.readyState !== 1) return;
+
+        const meta = encodeMuxMeta(sessionId, status, option);
+        let packet = meta;
+
+        if ((option & MUX_OPTION_DATA) !== 0 && payload && payload.byteLength > 0) {
+            const data = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+            const len = new Uint8Array(2);
+            new DataView(len.buffer).setUint16(0, data.byteLength);
+            packet = concatUint8Arrays(packet, len, data);
+        }
+
+        if (!this.sentRespHeader) {
+            const vlessRespHeader = new Uint8Array([this.versionByte, 0]);
+            packet = concatUint8Arrays(vlessRespHeader, packet);
+            this.sentRespHeader = true;
+        }
+
+        this.webSocket.send(packet);
+    }
+
+    closeSession(sessionId, withError) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        this.sessions.delete(sessionId);
+        try {
+            session.socket.close();
+        } catch (error) {}
+        if (withError) {
+            this.sendMuxFrame(sessionId, MUX_STATUS_END, MUX_OPTION_ERROR, null);
+        }
+    }
+}
+
+function tryParseMuxFrame(buffer) {
+    if (buffer.byteLength < 2) return null;
+
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const metaLen = view.getUint16(0);
+    if (metaLen > 512) return null;
+    if (buffer.byteLength < 2 + metaLen) return null;
+
+    const meta = buffer.slice(2, 2 + metaLen);
+    if (meta.byteLength < 4) return null;
+
+    const metaView = new DataView(meta.buffer, meta.byteOffset, meta.byteLength);
+    let offset = 0;
+    const sessionId = metaView.getUint16(offset);
+    offset += 2;
+    const status = metaView.getUint8(offset++);
+    const option = metaView.getUint8(offset++);
+
+    let target = null;
+    if (status === MUX_STATUS_NEW) {
+        if (meta.byteLength < offset + 4) return null;
+        const network = metaView.getUint8(offset++);
+        const port = metaView.getUint16(offset);
+        offset += 2;
+        const address = parseMuxAddress(meta, offset);
+        if (!address) return null;
+        target = { network, port, hostname: address.hostname };
+    }
+
+    let data = null;
+    let totalSize = 2 + metaLen;
+    if ((option & MUX_OPTION_DATA) !== 0) {
+        if (buffer.byteLength < totalSize + 2) return null;
+        const dataLen = new DataView(buffer.buffer, buffer.byteOffset + totalSize, 2).getUint16(0);
+        if (buffer.byteLength < totalSize + 2 + dataLen) return null;
+        data = buffer.slice(totalSize + 2, totalSize + 2 + dataLen);
+        totalSize += 2 + dataLen;
+    }
+
+    return { sessionId, status, option, target, data, totalSize };
+}
+
+function parseMuxAddress(meta, offset) {
+    if (meta.byteLength <= offset) return null;
+    const type = new DataView(meta.buffer, meta.byteOffset + offset, 1).getUint8(0);
+    offset += 1;
+
+    if (type === 1) {
+        if (meta.byteLength < offset + 4) return null;
+        return { hostname: new Uint8Array(meta.slice(offset, offset + 4)).join('.') };
+    }
+
+    if (type === 2) {
+        if (meta.byteLength < offset + 1) return null;
+        const domainLen = new DataView(meta.buffer, meta.byteOffset + offset, 1).getUint8(0);
+        offset += 1;
+        if (meta.byteLength < offset + domainLen) return null;
+        return { hostname: new TextDecoder().decode(meta.slice(offset, offset + domainLen)) };
+    }
+
+    if (type === 3) {
+        if (meta.byteLength < offset + 16) return null;
+        const ipv6 = [];
+        const ipv6View = new DataView(meta.buffer, meta.byteOffset + offset, 16);
+        for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
+        return { hostname: ipv6.join(':') };
+    }
+
+    return null;
+}
+
+function encodeMuxMeta(sessionId, status, option) {
+    const out = new Uint8Array(6);
+    const view = new DataView(out.buffer);
+    view.setUint16(0, 4);
+    view.setUint16(2, sessionId);
+    view.setUint8(4, status);
+    view.setUint8(5, option);
+    return out;
+}
+
+function concatUint8Arrays(...arrs) {
+    let total = 0;
+    for (const arr of arrs) total += arr.byteLength;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const arr of arrs) {
+        out.set(arr, offset);
+        offset += arr.byteLength;
+    }
+    return out;
 }
 
 async function forwardUDP(udpChunk, webSocket, respHeader) {
