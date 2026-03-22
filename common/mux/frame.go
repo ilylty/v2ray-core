@@ -51,6 +51,9 @@ Frame format
 2 bytes - port
 n bytes - address
 
+When VLESS uses RequestCommandMux, bytes after the VLESS header are interpreted as a sequence of
+Mux frames in this format. SessionStatusNew carries target network/address/port to open a logical
+substream; SessionStatusKeep and SessionStatusEnd continue/close that logical substream by session id.
 */
 
 type FrameMetadata struct {

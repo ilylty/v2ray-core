@@ -12,6 +12,7 @@ import (
 )
 
 const (
+	// Version is the current VLESS request/response header version.
 	Version = byte(0)
 )
 
@@ -22,7 +23,13 @@ var addrParser = protocol.NewAddressParser(
 	protocol.PortThenAddress(),
 )
 
-// EncodeRequestHeader writes encoded request header into the given writer.
+// EncodeRequestHeader writes an encoded VLESS request header into writer.
+//
+// Header layout:
+//   version(1) + userUUID(16) + addons(variable) + command(1) + address/port(variable, non-Mux only)
+//
+// For RequestCommandMux, address and port are omitted from header encoding. The following payload
+// is expected to be Mux frames instead of a single direct upstream byte stream.
 func EncodeRequestHeader(writer io.Writer, request *protocol.RequestHeader, requestAddons *Addons) error {
 	buffer := buf.StackNew()
 	defer buffer.Release()
@@ -57,6 +64,9 @@ func EncodeRequestHeader(writer io.Writer, request *protocol.RequestHeader, requ
 }
 
 // DecodeRequestHeader decodes and returns (if successful) a RequestHeader from an input stream.
+//
+// For RequestCommandMux, the target is normalized to domain "v1.mux.cool" with port 0, which marks
+// this connection as a Mux transport channel after VLESS authentication.
 func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validator *vless.Validator) (*protocol.RequestHeader, *Addons, bool, error) {
 	buffer := buf.StackNew()
 	defer buffer.Release()
@@ -125,7 +135,7 @@ func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validat
 	}
 }
 
-// EncodeResponseHeader writes encoded response header into the given writer.
+// EncodeResponseHeader writes an encoded VLESS response header into writer.
 func EncodeResponseHeader(writer io.Writer, request *protocol.RequestHeader, responseAddons *Addons) error {
 	buffer := buf.StackNew()
 	defer buffer.Release()
@@ -145,7 +155,7 @@ func EncodeResponseHeader(writer io.Writer, request *protocol.RequestHeader, res
 	return nil
 }
 
-// DecodeResponseHeader decodes and returns (if successful) a ResponseHeader from an input stream.
+// DecodeResponseHeader decodes and returns (if successful) response addons from an input stream.
 func DecodeResponseHeader(reader io.Reader, request *protocol.RequestHeader) (*Addons, error) {
 	buffer := buf.StackNew()
 	defer buffer.Release()
